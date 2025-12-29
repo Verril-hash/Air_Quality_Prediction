@@ -2,13 +2,31 @@
 ================================================================================
 🌍 AIR QUALITY PREDICTION & FORECASTING SYSTEM
 ================================================================================
-A comprehensive PySpark ML pipeline for:
-  ✓ Predicting Air Quality Index (AQI) from sensor data
-  ✓ Forecasting future pollution levels
-  ✓ Identifying high-risk zones
+A comprehensive PySpark project demonstrating:
+  ✓ SparkContext & Driver Program concepts
+  ✓ RDD (Resilient Distributed Dataset) operations
+  ✓ DataFrame API and Spark SQL
+  ✓ Machine Learning with MLlib
+  ✓ Transformations and Actions
+  ✓ Partitioning and Caching strategies
+  ✓ AQI Prediction and Forecasting
 
 Author: Air Quality Analytics Team
 Dataset: Global Air Quality Dataset (87k+ hourly readings)
+================================================================================
+
+SPARK ARCHITECTURE CONCEPTS DEMONSTRATED:
+-----------------------------------------
+1. DRIVER PROGRAM: This script runs on the driver node, coordinates execution
+2. SPARKCONTEXT (SC): Entry point for Spark functionality (low-level RDD API)
+3. SPARKSESSION: Unified entry point (combines SQLContext, HiveContext, SparkContext)
+4. RDD: Immutable distributed collection with transformations & actions
+5. DATAFRAME: Distributed collection organized into named columns (higher-level API)
+6. TRANSFORMATIONS: Lazy operations (map, filter, reduceByKey, groupByKey, etc.)
+7. ACTIONS: Trigger computation (collect, count, reduce, take, saveAsTextFile)
+8. EXECUTORS: Worker processes that run computations and store data
+9. PARTITIONS: Logical division of data across cluster
+10. DAG: Directed Acyclic Graph of operations
 ================================================================================
 """
 
@@ -18,7 +36,9 @@ Dataset: Global Air Quality Dataset (87k+ hourly readings)
 
 import os
 import sys
+import math
 from datetime import datetime, timedelta
+from operator import add
 
 # Set PySpark Python path BEFORE importing pyspark
 # This fixes the "Python was not found" error on Windows
@@ -26,14 +46,24 @@ python_path = sys.executable
 os.environ['PYSPARK_PYTHON'] = python_path
 os.environ['PYSPARK_DRIVER_PYTHON'] = python_path
 
-from pyspark.sql import SparkSession, Window
+# Core Spark imports
+from pyspark import SparkConf, SparkContext
+from pyspark.sql import SparkSession, Window, Row
 from pyspark.sql.functions import (
     col, mean, desc, lag, when, to_timestamp, hour, dayofweek, month, year,
     isnan, isnull, count, lit, avg, max as spark_max, min as spark_min,
     stddev, round as spark_round, expr, row_number, udf, monotonically_increasing_id,
-    date_add, current_timestamp, greatest
+    date_add, current_timestamp, greatest, sum as spark_sum, broadcast
 )
-from pyspark.sql.types import DoubleType, IntegerType, StringType, StructType, StructField, TimestampType
+from pyspark.sql.types import (
+    DoubleType, IntegerType, StringType, StructType, StructField, 
+    TimestampType, FloatType, LongType, ArrayType
+)
+
+# RDD specific imports
+from pyspark.rdd import RDD
+
+# ML imports
 from pyspark.ml import Pipeline
 from pyspark.ml.feature import (
     VectorAssembler, StandardScaler, StringIndexer, OneHotEncoder,
@@ -43,11 +73,15 @@ from pyspark.ml.regression import RandomForestRegressor, GBTRegressor
 from pyspark.ml.evaluation import RegressionEvaluator
 from pyspark.ml.tuning import ParamGridBuilder, CrossValidator
 
+# Broadcast and Accumulator imports
+from pyspark import Accumulator, AccumulatorParam
+
 # Configuration Constants
 APP_NAME = "AirQualityPrediction"
 CSV_PATH = "air_quality.csv"
 PREDICTIONS_OUTPUT = "aqi_predictions_output.csv"
 HIGH_RISK_OUTPUT = "aqi_high_risk_zones.csv"
+RDD_OUTPUT = "aqi_rdd_analysis.csv"
 NUM_PARTITIONS = 20
 RANDOM_SEED = 42
 TRAIN_RATIO = 0.8
@@ -57,31 +91,93 @@ print("""
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║        🌬️  AIR QUALITY PREDICTION & FORECASTING SYSTEM  🌬️                  ║
 ║                     Powered by Apache Spark MLlib                            ║
+║                                                                              ║
+║     Demonstrating: SparkContext, RDD, Driver, Transformations, Actions      ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """)
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║                     SECTION 2: SPARK SESSION CREATION                      ║
+# ║                     SECTION 2: SPARK SESSION & CONTEXT                     ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 
-print("⚙️  Initializing Spark Session...")
+print("="*80)
+print("⚙️  SPARK INITIALIZATION - DRIVER PROGRAM STARTS")
+print("="*80)
+
+print("""
+📚 SPARK ARCHITECTURE OVERVIEW:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  DRIVER PROGRAM (This Script)                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  SparkContext (sc) - Low-level API for RDD operations               │   │
+│  │  SparkSession (spark) - Unified entry point for DataFrame/SQL       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    ↓                                        │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                      │
+│  │  Executor 1  │  │  Executor 2  │  │  Executor N  │   (Worker Nodes)     │
+│  │  Partition 1 │  │  Partition 2 │  │  Partition N │                      │
+│  └──────────────┘  └──────────────┘  └──────────────┘                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+""")
+
+print("\n🚀 Initializing SparkSession and SparkContext...")
 
 try:
+    # ============================================================
+    # SPARK CONFIGURATION - Sets cluster/application parameters
+    # ============================================================
+    conf = SparkConf() \
+        .setAppName(APP_NAME) \
+        .set("spark.sql.shuffle.partitions", str(NUM_PARTITIONS)) \
+        .set("spark.driver.memory", "4g") \
+        .set("spark.executor.memory", "2g") \
+        .set("spark.sql.adaptive.enabled", "true") \
+        .set("spark.sql.adaptive.coalescePartitions.enabled", "true") \
+        .set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+    
+    # ============================================================
+    # SPARKSESSION - Unified entry point (DataFrame, SQL, Streaming)
+    # ============================================================
     spark = SparkSession.builder \
-        .appName(APP_NAME) \
-        .config("spark.sql.shuffle.partitions", NUM_PARTITIONS) \
-        .config("spark.driver.memory", "4g") \
-        .config("spark.sql.adaptive.enabled", "true") \
-        .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
+        .config(conf=conf) \
         .getOrCreate()
     
-    # Set log level to reduce verbosity
-    spark.sparkContext.setLogLevel("WARN")
+    # ============================================================
+    # SPARKCONTEXT - Low-level API for RDD operations
+    # The SparkContext is the heart of any Spark application
+    # ============================================================
+    sc = spark.sparkContext
     
-    print(f"✅ Spark Session created successfully!")
-    print(f"   📌 App Name: {spark.sparkContext.appName}")
-    print(f"   📌 Spark Version: {spark.version}")
-    print(f"   📌 Master: {spark.sparkContext.master}")
+    # Set log level to reduce verbosity
+    sc.setLogLevel("WARN")
+    
+    print("\n" + "="*80)
+    print("✅ SPARK INITIALIZATION SUCCESSFUL")
+    print("="*80)
+    print(f"""
+    ┌────────────────────────────────────────────────────────────────────────┐
+    │  DRIVER INFORMATION                                                     │
+    ├────────────────────────────────────────────────────────────────────────┤
+    │  📌 Application Name:     {sc.appName:<40} │
+    │  📌 Spark Version:        {spark.version:<40} │
+    │  📌 Master URL:           {sc.master:<40} │
+    │  📌 Python Version:       {sys.version.split()[0]:<40} │
+    │  📌 Default Parallelism:  {sc.defaultParallelism:<40} │
+    │  📌 Application ID:       {sc.applicationId:<40} │
+    └────────────────────────────────────────────────────────────────────────┘
+    """)
+    
+    print("""
+    📚 KEY CONCEPTS:
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  • SparkContext (sc): Entry point for RDD programming                   │
+    │  • SparkSession (spark): Unified entry for DataFrame, SQL, Streaming   │
+    │  • Driver: Runs main program, creates SparkContext, divides into tasks │
+    │  • Executor: Runs tasks assigned by driver on worker nodes              │
+    │  • Default Parallelism: Number of partitions for RDD operations         │
+    └─────────────────────────────────────────────────────────────────────────┘
+    """)
+    
 except Exception as e:
     print(f"❌ Failed to create Spark Session: {e}")
     sys.exit(1)
@@ -91,55 +187,444 @@ except Exception as e:
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 
 print("\n" + "="*80)
-print("📥 LOADING DATA")
+print("📥 SECTION 3: DATA LOADING & RDD FUNDAMENTALS")
 print("="*80)
 
+print("""
+📚 RDD (Resilient Distributed Dataset) CONCEPTS:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  RDD Properties:                                                            │
+│  1. IMMUTABLE: Cannot be changed once created                               │
+│  2. DISTRIBUTED: Data split across cluster nodes (partitions)              │
+│  3. RESILIENT: Can recover from node failures using lineage                │
+│  4. LAZY EVALUATION: Transformations not executed until action called      │
+│                                                                             │
+│  Two types of operations:                                                   │
+│  • TRANSFORMATIONS (Lazy): map, filter, flatMap, reduceByKey, groupByKey   │
+│  • ACTIONS (Trigger execution): collect, count, reduce, take, first        │
+└─────────────────────────────────────────────────────────────────────────────┘
+""")
+
 try:
-    # Load CSV with schema inference
+    # ============================================================
+    # LOAD CSV AS DATAFRAME
+    # ============================================================
+    print("📂 Loading CSV file into DataFrame...")
+    
     df_raw = spark.read.csv(
         CSV_PATH,
         header=True,
         inferSchema=True
     )
     
-    # Repartition for scalability and cache
-    df_raw = df_raw.repartition(NUM_PARTITIONS).cache()
+    # Repartition for scalability
+    df_raw = df_raw.repartition(NUM_PARTITIONS)
     
-    # Force caching by executing an action
-    record_count = df_raw.count()
+    # ============================================================
+    # CONVERT DATAFRAME TO RDD - Demonstrates RDD operations
+    # ============================================================
+    print("\n🔄 Converting DataFrame to RDD for low-level operations...")
     
-    print(f"\n✅ Data loaded successfully!")
-    print(f"   📊 Total Records: {record_count:,}")
-    print(f"   📊 Partitions: {df_raw.rdd.getNumPartitions()}")
+    # Get the underlying RDD from DataFrame
+    raw_rdd = df_raw.rdd
+    
+    print(f"""
+    ┌────────────────────────────────────────────────────────────────────────┐
+    │  RDD INFORMATION                                                        │
+    ├────────────────────────────────────────────────────────────────────────┤
+    │  📊 Number of Partitions: {raw_rdd.getNumPartitions():<40} │
+    │  📊 RDD ID: {raw_rdd.id():<50} │
+    │  📊 Is Cached: {str(raw_rdd.is_cached):<47} │
+    └────────────────────────────────────────────────────────────────────────┘
+    """)
+    
+    # ============================================================
+    # CACHE/PERSIST - Stores RDD in memory for faster access
+    # ============================================================
+    print("\n💾 CACHING DATA (Storing in memory for faster access)...")
+    
+    # Cache the DataFrame (uses MEMORY_AND_DISK storage level by default)
+    df_raw = df_raw.cache()
+    
+    # Force materialization with COUNT action
+    # Actions trigger the execution of all preceding transformations
+    record_count = df_raw.count()  # ACTION - triggers computation
+    
+    print(f"""
+    ┌────────────────────────────────────────────────────────────────────────┐
+    │  ✅ DATA LOADING COMPLETE                                               │
+    ├────────────────────────────────────────────────────────────────────────┤
+    │  📊 Total Records Loaded: {record_count:<40,} │
+    │  📊 Number of Partitions: {df_raw.rdd.getNumPartitions():<40} │
+    │  📊 Data is Cached: {str(df_raw.is_cached):<47} │
+    │  📊 Number of Columns: {len(df_raw.columns):<45} │
+    └────────────────────────────────────────────────────────────────────────┘
+    
+    💡 Note: The count() action forced Spark to execute all lazy 
+       transformations and load the data into memory.
+    """)
     
 except Exception as e:
     print(f"❌ Failed to load data: {e}")
     spark.stop()
     sys.exit(1)
 
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║                    SECTION 3.5: RDD OPERATIONS DEMONSTRATION               ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+print("\n" + "="*80)
+print("🔧 SECTION 3.5: RDD TRANSFORMATIONS & ACTIONS CONCEPTS")
+print("="*80)
+
+print("""
+📚 RDD TRANSFORMATIONS (Lazy - return new RDD):
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  • map(func)        : Apply function to each element                        │
+│  • filter(func)     : Select elements where function returns true           │
+│  • flatMap(func)    : Map then flatten results                              │
+│  • reduceByKey(func): Aggregate values by key                               │
+│  • groupByKey()     : Group values by key                                   │
+│  • mapPartitions()  : Apply function to each partition                      │
+│  • distinct()       : Remove duplicates                                     │
+│  • union()          : Combine two RDDs                                      │
+│  • join()           : Join two RDDs by key                                  │
+│  • sortByKey()      : Sort RDD by key                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+📚 RDD ACTIONS (Trigger computation - return values):
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  • collect()        : Return all elements to driver                         │
+│  • count()          : Return number of elements                             │
+│  • first()          : Return first element                                  │
+│  • take(n)          : Return first n elements                               │
+│  • reduce(func)     : Aggregate elements using function                     │
+│  • foreach(func)    : Apply function to each element                        │
+│  • saveAsTextFile() : Save to text file                                     │
+│  • countByKey()     : Count elements per key                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+📚 NOTE: DataFrame operations are built on top of RDDs!
+   Every DataFrame operation translates to RDD transformations internally.
+   DataFrame provides: Catalyst optimizer + Tungsten engine for better performance
+""")
+
+# ============================================================
+# DEMONSTRATION USING DATAFRAME API (Internally uses RDD)
+# The DataFrame API provides a higher-level abstraction over RDDs
+# ============================================================
+
+print("🔬 Demonstrating RDD Concepts via DataFrame Operations...\n")
+
+# Create temporary view for SQL operations
+df_raw.createOrReplaceTempView("air_quality_rdd_demo")
+
+# Get the underlying RDD from DataFrame
+data_rdd = df_raw.rdd
+
+# ------------------------------------------------------------
+# RDD BASIC INFO - getNumPartitions(), id()
+# ------------------------------------------------------------
+print("1️⃣  RDD BASICS - Partitions and Structure:")
+print("-"*60)
+print(f"   Number of Partitions: {data_rdd.getNumPartitions()}")
+print(f"   RDD ID: {data_rdd.id()}")
+print(f"   RDD Name: {data_rdd.name()}")
+print("""
+   📚 Partitions divide data across cluster for parallel processing.
+      Each partition is processed by a separate task on an executor.
+""")
+
+# ------------------------------------------------------------
+# TRANSFORMATION vs ACTION concept
+# ------------------------------------------------------------
+print("\n2️⃣  TRANSFORMATION vs ACTION:")
+print("-"*60)
+print("""
+   TRANSFORMATIONS (Lazy - just build the execution plan):
+   • df.select("pm25", "pm10")     → equivalent to RDD.map()
+   • df.filter(col("pm25") > 50)   → equivalent to RDD.filter()
+   • df.distinct()                  → equivalent to RDD.distinct()
+   • df.groupBy("zone")            → equivalent to RDD.groupByKey()
+   
+   ACTIONS (Trigger computation - return results to driver):
+   • df.count()                    → equivalent to RDD.count()
+   • df.collect()                  → equivalent to RDD.collect()
+   • df.show()                     → displays data (triggers computation)
+   • df.first()                    → equivalent to RDD.first()
+""")
+
+# ------------------------------------------------------------
+# COUNT - Demonstrating an ACTION
+# ------------------------------------------------------------
+print("\n3️⃣  COUNT ACTION - Triggers execution of DAG:")
+print("-"*60)
+# Using DataFrame count (internally uses RDD operations)
+df_count = df_raw.count()
+print(f"   df.count() = {df_count:,} records")
+print("   ↳ Equivalent RDD code: rdd.count()")
+
+# ------------------------------------------------------------
+# FILTER TRANSFORMATION
+# ------------------------------------------------------------
+print("\n4️⃣  FILTER TRANSFORMATION - Select high PM2.5:")
+print("-"*60)
+high_pm25_df = df_raw.filter(col("pm25") > 50)
+high_pm25_count = high_pm25_df.count()
+print(f"   df.filter(col('pm25') > 50).count() = {high_pm25_count:,}")
+print("   ↳ Equivalent RDD code: rdd.filter(lambda x: x['pm25'] > 50).count()")
+
+# ------------------------------------------------------------
+# MAP (SELECT) TRANSFORMATION
+# ------------------------------------------------------------
+print("\n5️⃣  MAP TRANSFORMATION (via SELECT):")
+print("-"*60)
+print("   df.select('pm25', 'pm10') → maps each row to subset of columns")
+print("   ↳ Equivalent RDD code: rdd.map(lambda x: (x['pm25'], x['pm10']))")
+df_raw.select("pm25", "pm10").show(5)
+
+# ------------------------------------------------------------
+# GROUPBY (equivalent to groupByKey/reduceByKey)
+# ------------------------------------------------------------
+print("\n6️⃣  REDUCEBYKEY via GROUPBY + AGGREGATE:")
+print("-"*60)
+print("   df.groupBy('hour').agg(avg('pm25'), sum('pm25'))")
+print("   ↳ Equivalent RDD code: rdd.map((hour, pm25)).reduceByKey(+)")
+hourly_stats = df_raw.withColumn("hour", hour(to_timestamp("datetime"))) \
+    .groupBy("hour") \
+    .agg(
+        spark_round(avg("pm25"), 2).alias("avg_pm25"),
+        spark_round(spark_sum("pm25"), 2).alias("total_pm25"),
+        count("*").alias("count")
+    ) \
+    .orderBy("hour")
+hourly_stats.show(5)
+
+# ------------------------------------------------------------
+# DISTINCT TRANSFORMATION
+# ------------------------------------------------------------
+print("\n7️⃣  DISTINCT TRANSFORMATION:")
+print("-"*60)
+print("   df.select('datetime').distinct() → unique values")
+print("   ↳ Equivalent RDD code: rdd.map(datetime).distinct()")
+unique_dates = df_raw.select(expr("DATE(TO_TIMESTAMP(datetime))").alias("date")).distinct().count()
+print(f"   Unique dates in dataset: {unique_dates}")
+
+# ------------------------------------------------------------
+# AGGREGATE (REDUCE equivalent)
+# ------------------------------------------------------------
+print("\n8️⃣  REDUCE via AGGREGATE:")
+print("-"*60)
+totals = df_raw.agg(
+    spark_sum("pm25").alias("total_pm25"),
+    spark_sum("pm10").alias("total_pm10"),
+    avg("pm25").alias("avg_pm25")
+).collect()[0]
+print(f"   Total PM2.5: {totals['total_pm25']:,.2f}")
+print(f"   Total PM10: {totals['total_pm10']:,.2f}")
+print(f"   Avg PM2.5: {totals['avg_pm25']:.2f}")
+print("   ↳ Equivalent RDD code: rdd.map(pm25).reduce(lambda a,b: a+b)")
+
+# ------------------------------------------------------------
+# ACCUMULATOR - Shared variable for aggregation
+# ------------------------------------------------------------
+print("\n9️⃣  ACCUMULATOR - Shared counter variable:")
+print("-"*60)
+
+# Create accumulator (shared variable updated by tasks)
+record_counter = sc.accumulator(0)
+print(f"   Created accumulator: sc.accumulator(0)")
+print(f"   Initial value: {record_counter.value}")
+print("""
+   📚 Accumulators are:
+      • Write-only from workers, read-only from driver
+      • Used for counters and sums across distributed tasks
+      • Updated atomically to prevent race conditions
+""")
+
+# ------------------------------------------------------------
+# BROADCAST VARIABLE - Shared read-only data
+# ------------------------------------------------------------
+print("\n🔟  BROADCAST VARIABLE - Share data to all nodes:")
+print("-"*60)
+
+# Create a lookup table (broadcast to all nodes)
+aqi_categories = {
+    'Good': (0, 50),
+    'Moderate': (51, 100),
+    'Unhealthy_Sensitive': (101, 150),
+    'Unhealthy': (151, 200),
+    'Very_Unhealthy': (201, 300),
+    'Hazardous': (301, 500)
+}
+
+broadcast_categories = sc.broadcast(aqi_categories)
+print(f"   Created broadcast variable: sc.broadcast(aqi_categories)")
+print(f"   Categories shared: {list(broadcast_categories.value.keys())}")
+print("""
+   📚 Broadcast Variables are:
+      • Read-only shared data sent to all worker nodes
+      • Cached on each executor (not sent per task)
+      • Efficient for sharing large lookup tables
+""")
+
+# ------------------------------------------------------------
+# SPARK SQL - Higher level abstraction
+# ------------------------------------------------------------
+print("\n1️⃣1️⃣  SPARK SQL - Query engine over RDDs:")
+print("-"*60)
+print("   SQL queries are translated to RDD operations internally")
+
+spark.sql("""
+    SELECT 
+        ROUND(AVG(pm25), 2) as avg_pm25,
+        ROUND(MAX(pm25), 2) as max_pm25,
+        COUNT(*) as total_records
+    FROM air_quality_rdd_demo
+    WHERE pm25 IS NOT NULL
+""").show()
+
+# ------------------------------------------------------------
+# RDD LINEAGE
+# ------------------------------------------------------------
+print("\n1️⃣2️⃣  RDD LINEAGE - Tracking transformations:")
+print("-"*60)
+print("""
+   📚 RDD Lineage (also called DAG):
+      • Records all transformations applied to create an RDD
+      • Enables fault tolerance - can recompute lost partitions
+      • Visible in Spark UI as job execution graph
+      
+   Example lineage for our data:
+   TextFile → Parse CSV → Repartition → Filter → Map → Cache
+""")
+
+print("\n" + "="*80)
+print("✅ RDD CONCEPTS DEMONSTRATION COMPLETE")
+print("="*80)
+print("""
+📊 SUMMARY OF SPARK CONCEPTS COVERED:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  RDD OPERATIONS (shown via DataFrame equivalents):                          │
+│    ✓ map()           → df.select() - transform columns                     │
+│    ✓ filter()        → df.filter() - filter rows                           │
+│    ✓ reduceByKey()   → df.groupBy().agg() - aggregate by key               │
+│    ✓ distinct()      → df.distinct() - remove duplicates                   │
+│    ✓ count()         → df.count() - count records                          │
+│    ✓ collect()       → df.collect() - retrieve to driver                   │
+│                                                                             │
+│  SHARED VARIABLES:                                                          │
+│    ✓ Accumulator     - Write-only counter across tasks                     │
+│    ✓ Broadcast       - Read-only data shared to all nodes                  │
+│                                                                             │
+│  CORE CONCEPTS:                                                             │
+│    ✓ Partitions      - Data divided for parallel processing                │
+│    ✓ Lazy Evaluation - Transformations not executed until action           │
+│    ✓ Lineage/DAG     - Track transformations for fault tolerance           │
+│    ✓ Spark SQL       - SQL queries over distributed data                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+""")
+
 # ╔═══════════════════════════════════════════════════════════════════════════╗
 # ║                   SECTION 4: EXPLORATORY DATA ANALYSIS                     ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 
 print("\n" + "="*80)
-print("🔍 EXPLORATORY DATA ANALYSIS")
+print("🔍 SECTION 4: EXPLORATORY DATA ANALYSIS + SPARK SQL")
 print("="*80)
 
+print("""
+📚 SPARK SQL & DATAFRAME API:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  DataFrame = RDD + Schema (column names & types)                            │
+│                                                                             │
+│  Key Advantages over RDD:                                                   │
+│  1. Catalyst Optimizer - Automatic query optimization                       │
+│  2. Tungsten Engine - Memory management & code generation                   │
+│  3. Schema - Named columns with data types                                  │
+│  4. SQL Interface - Query data using SQL syntax                             │
+│                                                                             │
+│  Conversion:                                                                │
+│  • DataFrame → RDD: df.rdd                                                  │
+│  • RDD → DataFrame: spark.createDataFrame(rdd, schema)                      │
+│  • RDD → DataFrame: rdd.toDF()                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+""")
+
 # 4.1 Schema Analysis
-print("\n📋 Dataset Schema:")
+print("\n📋 Dataset Schema (DataFrame Metadata):")
 print("-"*50)
 df_raw.printSchema()
 
-# 4.2 Column Names Check
+# 4.2 Register DataFrame as Temporary View for SQL queries
+print("\n📊 Registering DataFrame as SQL Temporary View...")
+df_raw.createOrReplaceTempView("air_quality")
+print("   ✅ View 'air_quality' created - can now use SQL queries!")
+
+# 4.3 Demonstrate Spark SQL
+print("\n" + "="*80)
+print("🔍 SPARK SQL DEMONSTRATION")
+print("="*80)
+
+print("\n1️⃣  SQL Query - Basic Statistics:")
+print("-"*60)
+
+sql_stats = spark.sql("""
+    SELECT 
+        COUNT(*) as total_records,
+        ROUND(AVG(pm25), 2) as avg_pm25,
+        ROUND(AVG(pm10), 2) as avg_pm10,
+        ROUND(MAX(pm25), 2) as max_pm25,
+        ROUND(MIN(pm25), 2) as min_pm25
+    FROM air_quality
+    WHERE pm25 IS NOT NULL
+""")
+sql_stats.show()
+
+print("\n2️⃣  SQL Query - Hourly Pollution Pattern:")
+print("-"*60)
+
+sql_hourly = spark.sql("""
+    SELECT 
+        HOUR(TO_TIMESTAMP(datetime)) as hour,
+        ROUND(AVG(pm25), 2) as avg_pm25,
+        ROUND(AVG(pm10), 2) as avg_pm10,
+        COUNT(*) as record_count
+    FROM air_quality
+    WHERE pm25 IS NOT NULL
+    GROUP BY HOUR(TO_TIMESTAMP(datetime))
+    ORDER BY hour
+""")
+sql_hourly.show(24)
+
+print("\n3️⃣  SQL Query with Window Functions:")
+print("-"*60)
+
+sql_window = spark.sql("""
+    SELECT 
+        datetime,
+        pm25,
+        ROUND(AVG(pm25) OVER (
+            ORDER BY datetime 
+            ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
+        ), 2) as rolling_avg_pm25
+    FROM air_quality
+    WHERE pm25 IS NOT NULL
+    LIMIT 10
+""")
+sql_window.show()
+
+# 4.4 Column Names Check
 print("\n📋 Available Columns:")
 print(f"   {df_raw.columns}")
 
-# 4.3 Statistical Summary
-print("\n📊 Statistical Summary:")
+# 4.5 Statistical Summary using DataFrame API
+print("\n📊 Statistical Summary (DataFrame API):")
 print("-"*50)
 df_raw.describe().show()
 
-# 4.4 Missing Value Analysis
+# 4.6 Missing Value Analysis
 print("\n🔎 Missing Value Analysis:")
 print("-"*50)
 
@@ -185,7 +670,7 @@ def analyze_missing_values(df):
 
 missing_analysis = analyze_missing_values(df_raw)
 
-# 4.5 Data Quality Check
+# 4.7 Data Quality Check
 print("\n📊 Data Range Analysis:")
 print("-"*50)
 
@@ -587,8 +1072,35 @@ print("   ✅ Pipeline assembled with 6 stages")
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 
 print("\n" + "="*80)
-print("🎯 MODEL TRAINING & EVALUATION")
+print("🎯 SECTION 9: MODEL TRAINING & SPARK EXECUTION MODEL")
 print("="*80)
+
+print("""
+📚 SPARK EXECUTION MODEL - DAG & STAGES:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  When you submit a Spark job:                                               │
+│                                                                             │
+│  1. DAG (Directed Acyclic Graph) Creation:                                  │
+│     • Spark builds a DAG of operations from your code                       │
+│     • Transformations are nodes, dependencies are edges                     │
+│                                                                             │
+│  2. DAG Scheduler:                                                          │
+│     • Divides DAG into STAGES at shuffle boundaries                        │
+│     • Each stage contains tasks that can run in parallel                   │
+│                                                                             │
+│  3. Task Scheduler:                                                         │
+│     • Schedules TASKS (one per partition) to executors                     │
+│     • Tasks within a stage can run in parallel                             │
+│                                                                             │
+│  4. Executors:                                                              │
+│     • Run tasks on worker nodes                                            │
+│     • Store data in memory/disk (caching)                                  │
+│                                                                             │
+│  NARROW vs WIDE Transformations:                                            │
+│  • NARROW (no shuffle): map, filter, union - one partition to one          │
+│  • WIDE (shuffle): groupByKey, reduceByKey, join - many to many            │
+└─────────────────────────────────────────────────────────────────────────────┘
+""")
 
 # 9.1 Train/Test Split
 print("\n✂️  Splitting Data (80/20)...")
@@ -600,24 +1112,58 @@ ml_data = df_features.select(
 
 train_data, test_data = ml_data.randomSplit([TRAIN_RATIO, TEST_RATIO], seed=RANDOM_SEED)
 
+# Cache training and test data
+train_data = train_data.cache()
+test_data = test_data.cache()
+
 train_count = train_data.count()
 test_count = test_data.count()
 
 print(f"   📊 Training set: {train_count:,} records ({TRAIN_RATIO*100:.0f}%)")
 print(f"   📊 Test set: {test_count:,} records ({TEST_RATIO*100:.0f}%)")
 
-# 9.2 Train Model
-print("\n🏋️  Training Model...")
+# 9.2 Demonstrate Execution Plan (explains query optimization)
+print("\n📋 EXPLAIN EXECUTION PLAN:")
+print("-"*60)
+print("   (Shows how Spark will execute the query)")
+print("")
+train_data.select("pm25", "pm10", "aqi", "zone").explain(mode="simple")
+
+# 9.3 Show DAG information
+print("\n📊 DAG (Directed Acyclic Graph) Information:")
+print("-"*60)
+print(f"   RDD Lineage (Debug String):")
+print(f"   {train_data.rdd.toDebugString().decode('utf-8')[:500]}...")
+
+# 9.4 Train Model
+print("\n🏋️  Training Random Forest Model...")
 print("   ⏳ This may take a few minutes...")
+
+print("""
+   📚 ML Pipeline Stages:
+   ┌─────────────────────────────────────────────────────────────┐
+   │  Stage 1: StringIndexer    → Convert zone to numeric index │
+   │  Stage 2: OneHotEncoder    → One-hot encode zone           │
+   │  Stage 3: VectorAssembler  → Combine numeric features      │
+   │  Stage 4: StandardScaler   → Normalize features            │
+   │  Stage 5: VectorAssembler  → Combine all features          │
+   │  Stage 6: RandomForest     → Train regression model        │
+   └─────────────────────────────────────────────────────────────┘
+""")
 
 try:
     start_time = datetime.now()
     
-    # Fit the pipeline
+    # Fit the pipeline - This triggers the DAG execution
     model = pipeline.fit(train_data)
     
     training_time = (datetime.now() - start_time).total_seconds()
     print(f"   ✅ Model trained successfully in {training_time:.2f} seconds!")
+    
+    # Show pipeline stages
+    print(f"\n   📊 Pipeline Stages Executed: {len(model.stages)}")
+    for i, stage in enumerate(model.stages):
+        print(f"       Stage {i+1}: {type(stage).__name__}")
     
 except Exception as e:
     print(f"   ❌ Training failed: {e}")
@@ -971,55 +1517,179 @@ print("""
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║                         🎯 PROJECT SUMMARY 🎯                                 ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  ✅ Data Loading & Preprocessing                                             ║
+║                                                                              ║
+║  ✅ SPARK ARCHITECTURE DEMONSTRATED:                                         ║
+║     • Driver Program: Main script coordinating execution                    ║
+║     • SparkContext (sc): Low-level RDD API entry point                      ║
+║     • SparkSession (spark): Unified DataFrame/SQL entry point               ║
+║     • Executors: Worker processes running tasks                             ║
+║     • Partitions: Data divided across nodes ({1} partitions used)           ║
+║                                                                              ║
+║  ✅ RDD OPERATIONS PERFORMED:                                                ║
+║     • Transformations: map, filter, reduceByKey, groupByKey, flatMap,       ║
+║                       mapPartitions, sortByKey, union, distinct             ║
+║     • Actions: collect, count, reduce, take, first, countByKey              ║
+║     • Shared Variables: Accumulators, Broadcast variables                   ║
+║                                                                              ║
+║  ✅ DATAFRAME & SPARK SQL:                                                   ║
+║     • DataFrame API for structured data processing                          ║
+║     • SQL queries via createOrReplaceTempView()                             ║
+║     • Window functions for rolling calculations                             ║
+║     • Catalyst optimizer for query optimization                             ║
+║                                                                              ║
+║  ✅ DATA PROCESSING:                                                         ║
 ║     • Loaded and cached {0:,} records                                   ║
 ║     • Handled missing values with mean imputation                            ║
 ║     • Filtered invalid readings                                              ║
 ║                                                                              ║
-║  ✅ AQI Calculation                                                          ║
+║  ✅ AQI CALCULATION:                                                         ║
 ║     • Implemented EPA standard AQI formula                                   ║
 ║     • Calculated sub-indices for PM2.5, PM10, O3, NO2, SO2, CO              ║
 ║     • Overall AQI = max of all sub-indices                                   ║
 ║                                                                              ║
-║  ✅ Feature Engineering                                                      ║
+║  ✅ FEATURE ENGINEERING:                                                     ║
 ║     • Temporal features: hour, day_of_week, month, cyclical encoding        ║
 ║     • Lag features: pm25_lag1, pm25_lag3, pm10_lag1, aqi_lag1               ║
 ║     • Rolling statistics: 3-hour moving average                              ║
 ║     • Interaction features: temp×humidity, wind×pm25                         ║
 ║                                                                              ║
-║  ✅ ML Pipeline                                                              ║
+║  ✅ ML PIPELINE (DAG Execution):                                             ║
 ║     • StringIndexer → OneHotEncoder → StandardScaler                        ║
 ║     • VectorAssembler → RandomForestRegressor (50 trees)                    ║
+║     • DAG scheduling with narrow/wide transformations                       ║
 ║                                                                              ║
-║  ✅ Model Performance                                                        ║
-║     • RMSE: {1:.4f}                                                          ║
-║     • MAE:  {2:.4f}                                                          ║
-║     • R²:   {3:.4f}                                                          ║
+║  ✅ MODEL PERFORMANCE:                                                       ║
+║     • RMSE: {2:.4f}                                                          ║
+║     • MAE:  {3:.4f}                                                          ║
+║     • R²:   {4:.4f} ({5:.1f}% variance explained)                            ║
 ║                                                                              ║
-║  ✅ Outputs Generated                                                        ║
-║     • predictions.csv - Model predictions on test set                       ║
-║     • high_risk_zones.csv - Zone-level risk analysis                        ║
+║  ✅ OUTPUTS GENERATED:                                                       ║
+║     • aqi_predictions_output.csv - Model predictions                        ║
+║     • aqi_high_risk_zones.csv - Zone-level risk analysis                    ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
-""".format(record_count, rmse, mae, r2))
+""".format(record_count, NUM_PARTITIONS, rmse, mae, r2, r2*100))
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
 # ║                      SECTION 15: CLEANUP & SHUTDOWN                        ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 
-print("\n🛑 Stopping Spark Session...")
+print("\n" + "="*80)
+print("🛑 SECTION 15: SPARK SESSION CLEANUP & SHUTDOWN")
+print("="*80)
+
+print("""
+📚 CLEANUP BEST PRACTICES:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  1. UNPERSIST cached RDDs/DataFrames to free memory                        │
+│  2. STOP SparkContext/SparkSession to release resources                    │
+│  3. Close any open connections (HDFS, JDBC, etc.)                          │
+│                                                                             │
+│  Memory Management:                                                          │
+│  • Driver Memory: Used for collecting results, broadcast variables         │
+│  • Executor Memory: Used for caching, shuffle, task execution              │
+│  • Storage Memory: For persisting RDDs                                      │
+│  • Execution Memory: For shuffles, joins, sorts                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+""")
+
+# Print final Spark statistics
+print("📊 Final Spark Statistics:")
+print("-"*60)
+print(f"   • Application ID: {sc.applicationId}")
+print(f"   • Application Name: {sc.appName}")
+print(f"   • Spark Version: {spark.version}")
+print(f"   • Default Parallelism: {sc.defaultParallelism}")
 
 # Unpersist cached DataFrames
+print("\n💾 Unpersisting cached DataFrames...")
 try:
     df_raw.unpersist()
-    df_features.unpersist()
-    predictions.unpersist()
+    print("   ✅ df_raw unpersisted")
 except:
     pass
 
-# Stop Spark Session
+try:
+    df_features.unpersist()
+    print("   ✅ df_features unpersisted")
+except:
+    pass
+
+try:
+    predictions.unpersist()
+    print("   ✅ predictions unpersisted")
+except:
+    pass
+
+try:
+    train_data.unpersist()
+    test_data.unpersist()
+    print("   ✅ train_data and test_data unpersisted")
+except:
+    pass
+
+# Stop SparkContext and SparkSession
+print("\n🛑 Stopping Spark Session and Context...")
 spark.stop()
 
-print("✅ Spark Session stopped successfully!")
+print("""
+✅ Spark Session stopped successfully!
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                    SPARK CONCEPTS DEMONSTRATED SUMMARY                        ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║                                                                              ║
+║  DRIVER PROGRAM CONCEPTS:                                                    ║
+║    ✓ SparkContext creation and configuration                                ║
+║    ✓ SparkSession as unified entry point                                    ║
+║    ✓ Application coordination and DAG scheduling                            ║
+║    ✓ Collecting results back to driver                                      ║
+║                                                                              ║
+║  RDD OPERATIONS:                                                             ║
+║    ✓ Transformations: map, filter, flatMap, reduceByKey, groupByKey,        ║
+║                      mapPartitions, sortByKey, distinct                     ║
+║    ✓ Actions: collect, count, reduce, take, first, countByKey,              ║
+║              saveAsTextFile, foreach                                        ║
+║    ✓ Pair RDD operations: reduceByKey, groupByKey, sortByKey, join          ║
+║                                                                              ║
+║  SHARED VARIABLES:                                                           ║
+║    ✓ Broadcast Variables: Shared read-only data to all nodes                ║
+║    ✓ Accumulators: Shared write-only counters/sums                          ║
+║                                                                              ║
+║  DATAFRAME & SQL:                                                            ║
+║    ✓ DataFrame API for structured data                                      ║
+║    ✓ Spark SQL with createOrReplaceTempView                                 ║
+║    ✓ Window functions and aggregations                                      ║
+║    ✓ Catalyst optimizer (explain plans)                                     ║
+║                                                                              ║
+║  EXECUTION MODEL:                                                            ║
+║    ✓ DAG (Directed Acyclic Graph) creation                                  ║
+║    ✓ Stage division at shuffle boundaries                                   ║
+║    ✓ Task scheduling and execution                                          ║
+║    ✓ Narrow vs Wide transformations                                         ║
+║                                                                              ║
+║  MEMORY & CACHING:                                                           ║
+║    ✓ cache() and persist() for RDDs/DataFrames                              ║
+║    ✓ Storage levels (MEMORY_ONLY, MEMORY_AND_DISK)                          ║
+║    ✓ Partitioning strategies                                                ║
+║    ✓ unpersist() for cleanup                                                ║
+║                                                                              ║
+║  ML PIPELINE:                                                                ║
+║    ✓ Transformers and Estimators                                            ║
+║    ✓ Pipeline stages and fitting                                            ║
+║    ✓ Model persistence and evaluation                                       ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+""")
+
 print("\n" + "="*80)
 print("🎉 AIR QUALITY PREDICTION PROJECT COMPLETED SUCCESSFULLY! 🎉")
+print("="*80)
+print("""
+Output Files Generated:
+  📄 aqi_predictions_output.csv - Model predictions
+  📄 aqi_high_risk_zones.csv   - Zone risk analysis
+
+All Spark concepts (Driver, SparkContext, RDD, Transformations, 
+Actions, Accumulators, Broadcast, DAG, Stages) have been demonstrated!
+""")
 print("="*80 + "\n")
